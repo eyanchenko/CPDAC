@@ -1,0 +1,193 @@
+## Subsampling algorithm for CP identification in large networks
+## Programmer: Eric Yanchenko
+## ekyanche@ncsu.edu
+
+library(Rcpp)
+library(doParallel)
+library(dplyr)
+
+### Function to find the core-periphery assignments which maximize the Borgatti and Everett (2000) metric
+### Written in Rcpp
+### Code could be improved by updating existing value of objective function, instead of re-computing from scratch each time.
+
+cppFunction('IntegerVector borgattiCpp(IntegerMatrix A){
+
+  double n = A.nrow();
+  double m = n*(n-1)/2;
+  
+  
+  // Initialize vector 
+  
+  IntegerVector C(n);
+  
+  
+  for(int i = 0; i < n; i++){
+    
+    if(rand()%10 > 5){
+      C(i) = 1;
+    }else{
+      C(i) = 0;
+    }
+     
+  }
+  
+  
+  double sum_A = 0; 
+  double sum_CP = 0; 
+  double sum_ACP = 0;
+  
+  for (int i = 1; i < n; i++){
+      for(int j = 0; j < i; j++){
+        sum_A   += A(i,j);
+        sum_CP  += C(i) + C(j) - C(i)*C(j);
+        sum_ACP += A(i,j) * (C(i) + C(j) - C(i)*C(j)); 
+      }
+    }
+  
+  double obj_last = (sum_ACP - sum_A / m * sum_CP) / 
+    (sqrt(sum_A - sum_A/m*sum_A) * sqrt(sum_CP - sum_CP/m*sum_CP) );
+  
+                   
+  int ind = 1;
+  int n_iter = 0;
+  int max_iter = 100;
+  
+  IntegerVector Ctest = clone(C);
+  
+  IntegerVector v(n);
+  for(int i=0; i<n;i++){v(i) = i;}
+  
+  double obj_new = 0;
+  
+  while(ind > 0 & n_iter < max_iter){
+  
+  ind = 0;
+  /* Randomly shuffle node order */
+  int N = n;
+  for(int a=0;a<n;a++){
+    int b = round(rand()%N);
+    int c = v(a); v(a)=v(b); v(b)=c;
+  }
+  
+  
+  
+   for(int i = 0; i < n; i++){
+    
+     Ctest = clone(C);
+     Ctest(v(i)) = 1 - Ctest(v(i));
+     
+     
+     double sum_CP_test = 0; 
+     double sum_ACP_test = 0;
+  
+  for (int j = 1; j < n; j++){
+      for(int k = 0; k < j; k++){
+        sum_CP_test  += Ctest(j) + Ctest(k) - Ctest(j)*Ctest(k);
+        sum_ACP_test += A(j,k) * (Ctest(j) + Ctest(k) - Ctest(j)*Ctest(k)); 
+      }
+    }
+     
+     
+     /*
+     double sum_CP_test = sum_CP; 
+     double sum_ACP_test = sum_ACP;
+    
+    
+     for(int j = 0; j < n; j++){
+        sum_CP_test  += Ctest(i) + Ctest(j) - Ctest(i)*Ctest(j);
+        sum_ACP_test += A(i,j) * (C(i) + Ctest(j) - Ctest(i)*Ctest(j)); 
+     }
+     */
+    
+     obj_new = (sum_ACP_test - sum_A / m * sum_CP_test) / 
+      (sqrt(sum_A - sum_A/m*sum_A) * sqrt(sum_CP_test - sum_CP_test/m*sum_CP_test) );
+
+    
+     if(obj_new > obj_last){
+       C(v(i)) = Ctest(v(i));
+       ind++;
+       obj_last = obj_new;
+      
+       //sum_CP =  sum_CP_test; 
+       //sum_ACP = sum_ACP_test;
+     }
+    
+    
+    }
+    
+    n_iter++;
+    
+  }
+  
+  return( C );
+}')
+
+
+
+
+#' @title Core-Periphery divide-and-conquer algorithm
+#' @description This function finds the CP labels of
+#' a large network using a sub-sampling heuristic
+#' @param A adjacency matrix
+#' @param m proportion of network to sub-sample
+#' @param iters number of iterations to run
+#' @return Proportion of sub-samples assigned to the core
+#' @export
+
+dacCP <- function(A, m=0.10, iters=10000, no_cores = detectCores()-1){
+  
+  require(doParallel)
+  n = dim(A)[1]
+  
+  # set up parallelization
+  registerDoParallel(cores=no_cores)  
+  cl <- makeCluster(no_cores, type="FORK")
+  registerDoParallel(cl)
+  
+  # run sub-sampling scheme
+  out <- foreach(i=1:iters, .combine="+", .noexport = c("borgattiCpp")) %dopar% {
+    
+    # sub-sample nodes
+    idx <- sample(1:n, round(n*m))
+    B   <- A[idx, idx]
+    
+    # re-sample until non-empty matrix is returned
+    while(sum(B) == 0){
+      idx <- sample(1:n, round(n*m))
+      B   <- A[idx, idx]
+    }
+    
+    # Run Borgatti
+    C <- as.logical( borgattiCpp(B) )
+    
+    # return two vectors of length n with T or F for sampled or core
+    samp <- core <- rep(FALSE, n)
+    samp[idx] <- T
+    core[idx[C]] <- T
+    
+    return(cbind(core, samp))
+  }
+  
+  stopCluster(cl)
+  
+  # Proportions
+  props <- out[,1] / out[,2]
+  
+  # Find largest separation and define nodes above this as core
+  
+  M     <- matrix(0, nrow=n, ncol=3)
+  M[,1] <- 1:n   # node index
+  M[,2] <- props # proportion of samples in core
+
+  M <- M[order(M[,2],decreasing=TRUE),] # order by proportions
+  
+  d   <- -diff(M[,2])  
+  idx <- which.max(d)  # find largest difference
+  M[1:idx,3] <- 1     # all nodes above this are assigned to core
+  
+  M <- M[order(M[,1],decreasing=FALSE),]
+  
+  # return proportions and labels
+  return(list(props=M[,2], C=M[,3]))
+  
+}
